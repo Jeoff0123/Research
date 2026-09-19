@@ -1,44 +1,75 @@
+"""Generate a comparison chart from measured model_results.csv.
+
+Run model_validation.py first. This script intentionally does not contain
+hardcoded performance values.
+"""
+
+from pathlib import Path
+import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Data from Table II
-models = ['Logistic Reg. (L2)', 'Decision Tree', 'Random Forest']
-metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'ROC-AUC']
+RESULTS_PATH = Path("model_results.csv")
+OUTPUT_PATH = "model_comparison_hbn.png"
 
-# Scores in percentages for direct comparison
-scores = {
-    'Logistic Reg. (L2)': [85.42, 84.80, 85.10, 84.95, 93.20],
-    'Decision Tree': [88.75, 88.20, 88.50, 88.35, 94.10],
-    'Random Forest': [93.33, 93.10, 93.25, 93.17, 97.85]
+if not RESULTS_PATH.exists():
+    raise FileNotFoundError(
+        "model_results.csv was not found. Run model_validation.py first."
+    )
+
+results = pd.read_csv(RESULTS_PATH)
+
+required = {
+    "Model",
+    "Test_Accuracy",
+    "Test_Precision_macro",
+    "Test_Recall_macro",
+    "Test_F1_macro",
+    "Test_ROC_AUC_macro_OVR",
+}
+missing = required - set(results.columns)
+if missing:
+    raise ValueError(f"model_results.csv is missing columns: {sorted(missing)}")
+
+metrics = {
+    "Accuracy": "Test_Accuracy",
+    "Precision": "Test_Precision_macro",
+    "Recall": "Test_Recall_macro",
+    "F1": "Test_F1_macro",
+    "ROC-AUC": "Test_ROC_AUC_macro_OVR",
 }
 
-x = np.arange(len(metrics))  # metric locations
-width = 0.25  # bar width
+x = np.arange(len(metrics))
+width = 0.8 / len(results)
 
-plt.figure(figsize=(10, 5.5), dpi=300)
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Professional IEEE colors
+fig, ax = plt.subplots(figsize=(11, 6), dpi=300)
 
-for idx, (model_name, model_scores) in enumerate(scores.items()):
-    offset = (idx - 1) * width
-    rects = plt.bar(x + offset, model_scores, width, label=model_name, color=colors[idx], edgecolor='black', linewidth=0.8)
-    
-    # Add text labels on top of bars
-    for rect in rects:
-        height = rect.get_height()
-        plt.annotate(f'{height:.1f}%',
-                    xy=(rect.get_x() + rect.get_width() / 2, height),
-                    xytext=(0, 3),  # 3 points vertical offset
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=8, fontweight='bold')
+for i, row in results.iterrows():
+    values = [row[column] * 100 for column in metrics.values()]
+    offset = (i - (len(results) - 1) / 2) * width
+    bars = ax.bar(x + offset, values, width, label=row["Model"])
 
-plt.ylabel('Performance Metric Score (%)', fontsize=11, fontweight='bold')
-plt.title('Benchmark Performance Comparison Across Supervised ML Classifiers', fontsize=12, fontweight='bold', pad=15)
-plt.xticks(x, metrics, fontsize=10, fontweight='bold')
-plt.ylim(75, 103)
-plt.legend(loc='lower right', frameon=True, facecolor='white', framealpha=0.9, fontsize=10)
-plt.grid(axis='y', linestyle='--', alpha=0.5)
+    for bar in bars:
+        ax.annotate(
+            f"{bar.get_height():.1f}%",
+            (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+ax.set_ylabel("Score (%)")
+ax.set_title("Held-Out Test Performance Comparison")
+ax.set_xticks(x)
+ax.set_xticklabels(metrics.keys())
+ax.set_ylim(0, 105)
+ax.legend()
+ax.grid(axis="y", linestyle="--", alpha=0.4)
 
 plt.tight_layout()
-plt.savefig('model_comparison_bar_chart.png', dpi=300)
-print("Bar chart figure saved to 'model_comparison_bar_chart.png'")
+plt.savefig(OUTPUT_PATH, bbox_inches="tight")
+plt.close(fig)
 
+print(f"Chart saved to {OUTPUT_PATH}")
