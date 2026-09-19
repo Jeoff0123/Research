@@ -1,237 +1,368 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
+"""
+HBN PIU severity classification
+Research-ready validation pipeline using participant-level HBN data.
 
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import StandardScaler, label_binarize
+IMPORTANT:
+- This script does NOT generate synthetic data.
+- PCIAT items and PCIAT_Total are excluded from predictors because PCIAT_Total
+  defines the target severity.
+- Target bands:
+    0-30   = None
+    31-49  = Mild
+    50-79  = Moderate
+    80-100 = Severe
+- Put the real HBN participant-level CSV at DATASET_PATH before running.
+
+Outputs:
+- model_results.csv
+- confusion_matrices_hbn.png
+- roc_curves_hbn.png
+- model_comparison_hbn.png
+"""
+
+from pathlib import Path
+import re
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+    roc_auc_score, confusion_matrix, ConfusionMatrixDisplay,
+    roc_curve, auc,
 )
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, label_binarize
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 
-# Set seed for statistical reproducibility
-np.random.seed(42)
+warnings.filterwarnings("ignore")
 
-DATASET_PATH = 'processed_piu_dataset.csv'
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+DATASET_PATH = Path("hbn_piu_participant_data.csv")
 
-def generate_multi_domain_piu_dataset(filepath=DATASET_PATH, n_samples=1200):
-    print(f"Generating calibrated multi-domain dataset '{filepath}' matching HBN Data Dictionary...")
-    
-    # 1. Demographics
-    age = np.random.uniform(8.0, 18.0, size=n_samples)
-    sex = np.random.choice([0, 1], size=n_samples, p=[0.52, 0.48]) # 0=Male, 1=Female
-    
-    # 2. PCIAT Items (1-5 Likert scale)
-    pciat_items = {f'PCIAT_{i:02d}': np.random.randint(1, 6, size=n_samples) for i in range(1, 21)}
-    df = pd.DataFrame(pciat_items)
-    df['id'] = [f"HBN_{i:05d}" for i in range(1, n_samples + 1)]
-    df['Basic_Demos-Age'] = np.round(age, 1)
-    df['Basic_Demos-Sex'] = sex
-    
-    # 3. Physical & Vitals
-    df['Physical-BMI'] = np.random.normal(21.5, 4.2, size=n_samples).clip(13.0, 40.0)
-    df['Physical-HeartRate'] = np.random.normal(75, 10, size=n_samples).clip(55, 105).astype(int)
-    df['Physical-Systolic_BP'] = np.random.normal(110, 12, size=n_samples).clip(85, 145).astype(int)
-    
-    # 4. Bio-electric Impedance Analysis (BIA)
-    df['BIA-BIA_Fat'] = np.random.normal(22.0, 7.5, size=n_samples).clip(8.0, 50.0)
-    df['BIA-BIA_BMR'] = np.random.normal(1450, 250, size=n_samples).clip(900, 2200)
-    df['BIA-BIA_SMM'] = np.random.normal(20.0, 5.0, size=n_samples).clip(10.0, 38.0)
-    
-    # 5. Physical Activity (PAQ) & Internet Use
-    df['PAQ_Total'] = np.random.uniform(1.2, 4.8, size=n_samples)
-    df['PreInt_EduHx-hoursday'] = np.random.choice([0, 1, 2, 3], size=n_samples, p=[0.2, 0.35, 0.3, 0.15])
-    
-    # 6. Sleep Disturbance Scale (SDS)
-    df['SDS_Total_Raw'] = np.random.normal(38.0, 9.5, size=n_samples).clip(26, 75)
-    
-    # Feature Engineering Domain Aggregates
-    df['PCIAT_Total'] = df[[f'PCIAT_{i:02d}' for i in range(1, 21)]].sum(axis=1)
-    df['Interaction_Sleep_ScreenTime'] = df['PreInt_EduHx-hoursday'] * df['SDS_Total_Raw']
-    df['PCIAT_Emotional_Volatility'] = df[['PCIAT_13', 'PCIAT_16', 'PCIAT_18', 'PCIAT_20']].mean(axis=1)
-    df['Physical_Sedentary_Ratio'] = df['BIA-BIA_Fat'] / (df['PAQ_Total'] + 0.1)
-    
-    # Calibrated Non-linear Multi-Domain Latent Function
-    score = (
-        0.08 * df['PCIAT_Total'] +
-        0.04 * df['Interaction_Sleep_ScreenTime'] +
-        1.25 * df['PCIAT_Emotional_Volatility'] +
-        0.05 * df['Physical_Sedentary_Ratio'] +
-        1.40 * (df['PCIAT_03'] > 3).astype(float) * (df['SDS_Total_Raw'] > 40).astype(float) +
-        0.80 * (df['PreInt_EduHx-hoursday'] == 3).astype(float) +
-        np.random.normal(0, 0.55, size=n_samples)
-    )
-    
-    q33, q66 = np.percentile(score, [33.33, 66.67])
-    risk_level = np.zeros(n_samples, dtype=int)
-    risk_level[score >= q33] = 1
-    risk_level[score >= q66] = 2
-    
-    df['riskLevel'] = risk_level
-    df.to_csv(filepath, index=False)
-    print("Calibrated multi-domain dataset generated successfully.\n")
-    return df
+TARGET = "PIU_Severity"
+TARGET_ORDER = ["None", "Mild", "Moderate", "Severe"]
 
-# Generate or reload dataset
-if not os.path.exists(DATASET_PATH):
-    generate_multi_domain_piu_dataset(DATASET_PATH)
-
-# ---------------------------------------------------------
-# 1. LOAD PREPROCESSED MULTI-DOMAIN DATASET
-# ---------------------------------------------------------
-df = pd.read_csv(DATASET_PATH)
-
-# Feature matrix (X) and target vector (y)
-feature_cols = [c for c in df.columns if c not in ['id', 'PCIAT_Total', 'riskLevel']]
-X = df[feature_cols]
-y = df['riskLevel']  # 0 = Low Risk, 1 = Medium Risk, 2 = High Risk
-
-print(f"Dataset Loaded: {X.shape[0]} samples with {X.shape[1]} features across Demographics, PCIAT, BIA, Vitals, PAQ, and Sleep domains.")
-
-# ---------------------------------------------------------
-# 2. STRATIFIED 80/20 TRAIN-TEST SPLIT
-# ---------------------------------------------------------
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.20, stratify=y, random_state=42
-)
-
-# Standardize features for linear model convergence
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
-
-# ---------------------------------------------------------
-# 3. HYPERPARAMETER TUNING & EVALUATION PIPELINE
-# ---------------------------------------------------------
-models = {
-    'Logistic Reg. (L2)': (
-        LogisticRegression(max_iter=1000, random_state=42),
-        {'C': [0.01, 0.1, 1.0, 10.0]},
-        X_train_scaled, X_test_scaled
-    ),
-    'Decision Tree': (
-        DecisionTreeClassifier(random_state=42),
-        {'max_depth': [3, 5, 10, None], 'criterion': ['gini', 'entropy']},
-        X_train, X_test
-    ),
-    'Random Forest': (
-        RandomForestClassifier(random_state=42),
-        {'n_estimators': [50, 100, 200], 'max_depth': [5, 10, None]},
-        X_train, X_test
-    )
+PCIAT_PATTERN = re.compile(r"^PCIAT(?:_|-)", re.IGNORECASE)
+EXCLUDED_EXACT = {
+    "id", "ID", "subjectkey", "SubjectKey", "participant_id", "ParticipantID",
+    "riskLevel", "PIU_Severity", "PCIAT_Total",
+    "Interaction_Sleep_ScreenTime", "PCIAT_Emotional_Volatility",
+    "Physical_Sedentary_Ratio",
 }
 
-benchmark_results = []
-trained_estimators = {}
-model_scores_dict = {}
 
-for name, (model, param_grid, tr_x, te_x) in models.items():
-    grid = GridSearchCV(model, param_grid, cv=5, scoring='f1_macro', n_jobs=-1)
-    grid.fit(tr_x, y_train)
-    
-    best_estimator = grid.best_estimator_
-    trained_estimators[name] = (best_estimator, te_x)
-    
-    y_pred = best_estimator.predict(te_x)
-    y_proba = best_estimator.predict_proba(te_x)
-    
+def find_column(df, candidates):
+    lookup = {str(c).lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate.lower() in lookup:
+            return lookup[candidate.lower()]
+    return None
+
+
+def build_target(df):
+    total_col = find_column(df, ["PCIAT_Total", "PCIAT-Total"])
+    if total_col is None:
+        raise ValueError(
+            "PCIAT_Total was not found. Supply the real HBN participant-level "
+            "dataset containing PCIAT_Total."
+        )
+
+    total = pd.to_numeric(df[total_col], errors="coerce")
+    invalid = total.notna() & ~total.between(0, 100)
+    if invalid.any():
+        raise ValueError(
+            f"{invalid.sum()} PCIAT_Total values fall outside 0-100. "
+            "Check the source data and score coding."
+        )
+
+    target = pd.Series(pd.NA, index=df.index, dtype="string")
+    target.loc[total.between(0, 30)] = "None"
+    target.loc[total.between(31, 49)] = "Mild"
+    target.loc[total.between(50, 79)] = "Moderate"
+    target.loc[total.between(80, 100)] = "Severe"
+
+    if total.notna().sum() != target.notna().sum():
+        raise ValueError("Some non-missing PCIAT scores could not be assigned a class.")
+
+    return target
+
+
+def select_predictors(df):
+    excluded = set(EXCLUDED_EXACT)
+    for col in df.columns:
+        if PCIAT_PATTERN.match(str(col)):
+            excluded.add(col)
+
+    predictors = [
+        c for c in df.columns
+        if c not in excluded and not df[c].isna().all()
+    ]
+
+    if not predictors:
+        raise ValueError("No predictors remain after excluding PCIAT-derived variables.")
+
+    return predictors
+
+
+def make_preprocessor(X):
+    numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+
+    numeric_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ])
+
+    return ColumnTransformer([
+        ("num", numeric_pipe, numeric_cols),
+        ("cat", categorical_pipe, categorical_cols),
+    ])
+
+
+def evaluate_model(name, estimator, X_test, y_test, class_names):
+    y_pred = estimator.predict(X_test)
+    y_proba = estimator.predict_proba(X_test)
+
     acc = accuracy_score(y_test, y_pred)
-    prec = precision_score(y_test, y_pred, average='macro')
-    rec = recall_score(y_test, y_pred, average='macro')
-    f1 = f1_score(y_test, y_pred, average='macro')
-    auc_val = roc_auc_score(y_test, y_proba, multi_class='ovr', average='macro')
-    
-    model_scores_dict[name] = [acc * 100, prec * 100, rec * 100, f1 * 100, auc_val * 100]
-    
-    benchmark_results.append({
-        'Model': name,
-        'Acc.': f"{acc * 100:.2f}%",
-        'Prec.': f"{prec * 100:.2f}%",
-        'Rec.': f"{rec * 100:.2f}%",
-        'F1': f"{f1 * 100:.2f}%",
-        'AUC': f"{auc_val:.4f}"
-    })
+    precision = precision_score(y_test, y_pred, average="macro", zero_division=0)
+    recall = recall_score(y_test, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
 
-proof_table = pd.DataFrame(benchmark_results)
-print("\n=== VERIFIED MULTI-DOMAIN BENCHMARK PERFORMANCE TABLE (TABLE 4.1) ===")
-print(proof_table.to_string(index=False))
+    estimator_classes = estimator.classes_
+    class_to_index = {c: i for i, c in enumerate(estimator_classes)}
+    y_proba_aligned = np.zeros((len(y_test), len(class_names)))
+    for j, cls in enumerate(class_names):
+        if cls in class_to_index:
+            y_proba_aligned[:, j] = y_proba[:, class_to_index[cls]]
 
-# ---------------------------------------------------------
-# 4. GENERATE MODEL COMPARISON BAR CHART
-# ---------------------------------------------------------
-metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'ROC-AUC']
-x = np.arange(len(metrics))
-width = 0.25
+    y_test_bin = label_binarize(y_test, classes=class_names)
+    auc_macro = roc_auc_score(
+        y_test_bin, y_proba_aligned, multi_class="ovr", average="macro"
+    )
 
-plt.figure(figsize=(10, 5.5), dpi=300)
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+    return {
+        "Model": name,
+        "Accuracy": acc,
+        "Precision_macro": precision,
+        "Recall_macro": recall,
+        "F1_macro": f1,
+        "ROC_AUC_macro_OVR": auc_macro,
+        "y_pred": y_pred,
+        "y_proba": y_proba_aligned,
+    }
 
-for idx, (model_name, scores_list) in enumerate(model_scores_dict.items()):
-    offset = (idx - 1) * width
-    rects = plt.bar(x + offset, scores_list, width, label=model_name, color=colors[idx], edgecolor='black', linewidth=0.8)
-    for rect in rects:
-        height = rect.get_height()
-        plt.annotate(f'{height:.1f}%',
-                    xy=(rect.get_x() + rect.get_width() / 2, height),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=8, fontweight='bold')
 
-plt.ylabel('Performance Metric Score (%)', fontsize=11, fontweight='bold')
-plt.title('Benchmark Performance Comparison Across Supervised ML Classifiers', fontsize=12, fontweight='bold', pad=15)
-plt.xticks(x, metrics, fontsize=10, fontweight='bold')
-plt.ylim(60, 105)
-plt.legend(loc='lower right', frameon=True, facecolor='white', framealpha=0.9, fontsize=10)
-plt.grid(axis='y', linestyle='--', alpha=0.5)
+def main():
+    if not DATASET_PATH.exists():
+        raise FileNotFoundError(
+            f"{DATASET_PATH} was not found. Replace DATASET_PATH with the path "
+            "to the real HBN participant-level CSV. The old repository CSV was "
+            "synthetic and must not be used as evidence of HBN performance."
+        )
 
-plt.tight_layout()
-plt.savefig('model_comparison_bar_chart.png', dpi=300)
-print("\nSaved model comparison bar chart: 'model_comparison_bar_chart.png'")
+    df = pd.read_csv(DATASET_PATH)
+    if df.empty:
+        raise ValueError("The supplied dataset is empty.")
 
-# ---------------------------------------------------------
-# 5. GENERATE CONFUSION MATRICES
-# ---------------------------------------------------------
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-labels = ['Low Risk', 'Medium Risk', 'High Risk']
+    print(f"Rows: {len(df):,}")
+    print(f"Columns: {len(df.columns):,}")
 
-for idx, (name, (model, te_x)) in enumerate(trained_estimators.items()):
-    y_pred = model.predict(te_x)
-    cm = confusion_matrix(y_test, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-    disp.plot(ax=axes[idx], cmap='Blues', colorbar=False)
-    axes[idx].set_title(f"{name}\nTest Split Predictions", fontsize=11, fontweight='bold')
+    df[TARGET] = build_target(df)
+    df = df.loc[df[TARGET].notna()].copy()
 
-plt.tight_layout()
-plt.savefig('confusion_matrices_proof.png', dpi=300)
-print("Saved updated confusion matrices figure: 'confusion_matrices_proof.png'")
+    predictors = select_predictors(df)
+    X = df[predictors].copy()
+    y = pd.Series(df[TARGET].astype(str), index=df.index)
 
-# ---------------------------------------------------------
-# 6. GENERATE ROC CURVES
-# ---------------------------------------------------------
-fig_roc, ax_roc = plt.subplots(figsize=(8, 6))
-y_test_bin = label_binarize(y_test, classes=[0, 1, 2])
-colors_dict = {'Logistic Reg. (L2)': 'blue', 'Decision Tree': 'orange', 'Random Forest': 'green'}
+    observed_classes = [c for c in TARGET_ORDER if c in set(y)]
+    if len(observed_classes) < 2:
+        raise ValueError("At least two PIU severity classes are required.")
 
-for name, (model, te_x) in trained_estimators.items():
-    y_proba = model.predict_proba(te_x)
-    fpr, tpr, _ = roc_curve(y_test_bin.ravel(), y_proba.ravel())
-    roc_auc = auc(fpr, tpr)
-    ax_roc.plot(fpr, tpr, color=colors_dict[name], lw=2, label=f'{name} (micro-AUC = {roc_auc:.4f})')
+    class_counts = y.value_counts().reindex(observed_classes, fill_value=0)
+    print("\nTarget distribution:")
+    print(class_counts.to_string())
+    print(f"\nPredictors used: {len(predictors)}")
+    print("PCIAT items and PCIAT_Total are excluded from X.")
 
-ax_roc.plot([0, 1], [0, 1], 'k--', lw=1.5, label='Random Chance')
-ax_roc.set_xlim([0.0, 1.0])
-ax_roc.set_ylim([0.0, 1.05])
-ax_roc.set_xlabel('False Positive Rate', fontsize=11)
-ax_roc.set_ylabel('True Positive Rate', fontsize=11)
-ax_roc.set_title('Multi-Class Multi-Domain ROC Curves (20% Test Split)', fontsize=12, fontweight='bold')
-ax_roc.legend(loc="lower right")
-ax_roc.grid(True, alpha=0.3)
+    if int(class_counts.min()) < 6:
+        raise ValueError("The smallest target class has fewer than 6 observations; "
+                         "5-fold stratified CV is not reliable.")
 
-plt.tight_layout()
-plt.savefig('roc_curves_proof.png', dpi=300)
-print("Saved updated ROC curves figure: 'roc_curves_proof.png'")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
+    )
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    preprocessor = make_preprocessor(X_train)
+
+    models = {
+        "Logistic Regression": (
+            LogisticRegression(max_iter=3000, random_state=RANDOM_STATE),
+            {
+                "model__C": [0.01, 0.1, 1.0, 10.0],
+                "model__class_weight": [None, "balanced"],
+            },
+        ),
+        "Decision Tree": (
+            DecisionTreeClassifier(random_state=RANDOM_STATE),
+            {
+                "model__max_depth": [3, 5, 10, None],
+                "model__criterion": ["gini", "entropy"],
+                "model__class_weight": [None, "balanced"],
+            },
+        ),
+        "Random Forest": (
+            RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
+            {
+                "model__n_estimators": [100, 200, 400],
+                "model__max_depth": [5, 10, None],
+                "model__class_weight": [None, "balanced"],
+                "model__max_features": ["sqrt", "log2"],
+            },
+        ),
+    }
+
+    results = []
+    fitted = {}
+
+    for name, (model, param_grid) in models.items():
+        pipeline = Pipeline([
+            ("preprocess", preprocessor),
+            ("model", model),
+        ])
+
+        grid = GridSearchCV(
+            pipeline, param_grid, scoring="f1_macro", cv=cv, n_jobs=-1, refit=True
+        )
+        grid.fit(X_train, y_train)
+
+        evaluated = evaluate_model(
+            name, grid.best_estimator_, X_test, y_test, observed_classes
+        )
+        fitted[name] = (grid.best_estimator_, evaluated)
+
+        results.append({
+            "Model": name,
+            "CV_best_macro_F1": grid.best_score_,
+            "Test_Accuracy": evaluated["Accuracy"],
+            "Test_Precision_macro": evaluated["Precision_macro"],
+            "Test_Recall_macro": evaluated["Recall_macro"],
+            "Test_F1_macro": evaluated["F1_macro"],
+            "Test_ROC_AUC_macro_OVR": evaluated["ROC_AUC_macro_OVR"],
+            "Best_Params": str(grid.best_params_),
+        })
+
+        print(f"\n{name}")
+        print(f"Best CV macro-F1: {grid.best_score_:.4f}")
+        print(f"Best parameters: {grid.best_params_}")
+
+    results_df = pd.DataFrame(results)
+    results_df.to_csv("model_results.csv", index=False)
+
+    display_df = results_df.copy()
+    metric_cols = [
+        "CV_best_macro_F1", "Test_Accuracy", "Test_Precision_macro",
+        "Test_Recall_macro", "Test_F1_macro", "Test_ROC_AUC_macro_OVR",
+    ]
+    for col in metric_cols:
+        display_df[col] = display_df[col].map(lambda v: f"{v:.4f}")
+
+    print("\n=== HELD-OUT TEST SET RESULTS ===")
+    print(display_df.to_string(index=False))
+
+    # Confusion matrices
+    n_models = len(fitted)
+    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 4.5), squeeze=False)
+    axes = axes.ravel()
+
+    for ax, (name, (_, evaluated)) in zip(axes, fitted.items()):
+        cm = confusion_matrix(y_test, evaluated["y_pred"], labels=observed_classes)
+        disp = ConfusionMatrixDisplay(
+            confusion_matrix=cm, display_labels=observed_classes
+        )
+        disp.plot(ax=ax, colorbar=False)
+        ax.set_title(f"{name}\nHeld-out test set")
+
+    plt.tight_layout()
+    plt.savefig("confusion_matrices_hbn.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # ROC curves are micro-averaged; the table reports macro OVR AUC.
+    fig, ax = plt.subplots(figsize=(8, 6))
+    y_test_bin = label_binarize(y_test, classes=observed_classes)
+
+    for name, (_, evaluated) in fitted.items():
+        fpr, tpr, _ = roc_curve(
+            y_test_bin.ravel(), evaluated["y_proba"].ravel()
+        )
+        micro_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, linewidth=2,
+                label=f"{name} (micro-AUC={micro_auc:.4f})")
+
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.05])
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("Multi-Class ROC Curves — Held-Out Test Set")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("roc_curves_hbn.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Dynamic chart generated only from measured results.
+    chart_metrics = {
+        "Accuracy": "Test_Accuracy",
+        "Precision": "Test_Precision_macro",
+        "Recall": "Test_Recall_macro",
+        "F1": "Test_F1_macro",
+        "ROC-AUC": "Test_ROC_AUC_macro_OVR",
+    }
+
+    x = np.arange(len(chart_metrics))
+    width = 0.8 / len(results_df)
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    for i, row in results_df.iterrows():
+        values = [row[col] * 100 for col in chart_metrics.values()]
+        offset = (i - (len(results_df) - 1) / 2) * width
+        bars = ax.bar(x + offset, values, width, label=row["Model"])
+        for bar in bars:
+            ax.annotate(
+                f"{bar.get_height():.1f}%",
+                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8,
+            )
+
+    ax.set_ylabel("Score (%)")
+    ax.set_title("Held-Out Test Performance Comparison")
+    ax.set_xticks(x)
+    ax.set_xticklabels(chart_metrics.keys())
+    ax.set_ylim(0, 105)
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig("model_comparison_hbn.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print("\nSaved: model_results.csv, confusion_matrices_hbn.png, "
+          "roc_curves_hbn.png, model_comparison_hbn.png")
+
+
+if __name__ == "__main__":
+    main()
