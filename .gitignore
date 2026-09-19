@@ -1,3 +1,10 @@
 /expand_docx.py
 /PIU_IEEE_Two_Column_Article_Paper.docx
 /PIU_IEEE_Two_Column_Article_Paper_Updated.docx
+
+# Local research data and generated evaluation outputs
+/hbn_piu_participant_data.csv
+/model_results.csv
+/model_comparison_hbn.png
+/confusion_matrices_hbn.png
+/roc_curves_hbn.png
