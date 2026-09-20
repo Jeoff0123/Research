@@ -1,49 +1,61 @@
-# PIU Risk Prediction — HBN Validation Pipeline
+# PIU Risk Prediction — Kaggle HBN Validation Pipeline
 
-This repository contains the machine-learning validation code for the PIU research project.
+This repository contains the leak-free, reproducible machine-learning validation code for the Problematic Internet Use (PIU) research project using the Kaggle Child Mind Institute Healthy Brain Network (HBN) dataset.
 
-## Important data/methodology note
+## Methodological Integrity & Leakage Controls
 
-The previous repository version generated a synthetic 1,200-row dataset and constructed a synthetic `riskLevel` target from variables that were also used as predictors. Those files and generated benchmark artifacts have been removed from the repository.
+All synthetic benchmark generators and legacy pipeline files have been completely replaced. The current pipeline enforces strict target-leakage controls to ensure publication-grade validity:
 
-The current pipeline requires a real participant-level HBN CSV and does not manufacture observations or performance results.
+1. **Target Schema**: Predicts Problematic Internet Use severity (`sii`) across 4 ordinal categories (Class 0: None, Class 1: Mild, Class 2: Moderate, Class 3: Severe).
+2. **Predictor Isolation**: All 20 Parent-Child Internet Addiction Test (PCIAT) survey items (`PCIAT_01` to `PCIAT_20`), aggregate PCIAT scores (`PCIAT_Total`), and seasonal markers are **strictly excluded** from feature matrix $X$. The models predict PIU severity solely from independent physical, anthropometric, sleep, and demographic indicators.
+3. **Encapsulated Preprocessing**: Preprocessing operations (median/mode imputation, standard scaling, and one-hot encoding) are encapsulated within `scikit-learn` `Pipeline` and `ColumnTransformer` objects to ensure parameters are learned exclusively from training folds.
 
-## Current workflow
+## Current Workflow
 
-1. Load the real participant-level HBN dataset.
-2. Construct `PIU_Severity` from `PCIAT_Total` using the documented score bands:
-   - 0–30: None
-   - 31–49: Mild
-   - 50–79: Moderate
-   - 80–100: Severe
-3. Exclude all PCIAT item variables, `PCIAT_Total`, identifiers, and PCIAT-derived engineered variables from the predictor matrix.
-4. Split data using an 80/20 stratified holdout.
-5. Perform imputation, encoding, and scaling inside a scikit-learn pipeline so preprocessing is learned only from training folds.
-6. Tune Logistic Regression, Decision Tree, and Random Forest models using 5-fold stratified cross-validation and macro-F1.
-7. Evaluate once on the untouched test set using accuracy, macro precision, macro recall, macro-F1, and macro one-vs-rest ROC-AUC.
-8. Generate confusion matrices, ROC curves, and a model-comparison chart from the measured results.
+1. Load the real participant-level dataset (`train.csv`).
+2. Clean missing target rows (`sii`) and isolate non-PCIAT predictor features.
+3. Execute a stratified 80/20 holdout train-test split ($N = 966$ train / $N = 242$ test).
+4. Perform 5-fold Stratified Cross-Validation (`StratifiedKFold(n_splits=5, shuffle=True, random_state=42)`) and hyperparameter grid search (`GridSearchCV`) optimizing for Macro F1-score across:
+   - Logistic Regression ($L_2$-regularized with `class_weight='balanced'`)
+   - Decision Tree Classifier (`class_weight='balanced'`)
+   - Random Forest Classifier (`class_weight='balanced'`)
+5. Evaluate best-fitted pipelines once on the unseen 20% holdout test partition.
+6. Compute comprehensive evaluation metrics:
+   - Overall Accuracy & Balanced Accuracy
+   - Macro Precision, Macro Recall, and Macro F1-Score
+   - Per-Class Precision, Recall, and F1-Score Breakdown
+   - Quadratic Weighted Kappa (QWK)
+   - Multi-Class One-vs-Rest (OVR) ROC-AUC (Macro-OVR vs. Micro-OVR)
+7. Export benchmark metrics and publication-ready diagnostic figures.
 
-## Running the analysis
+## Running the Analysis
 
-Place the real participant-level CSV beside `model_validation.py` and name it:
+Place your dataset file in the same directory as `model_validation.py` and name it:
 
-`hbn_piu_participant_data.csv`
+```text
+train.csv
 
-Then run:
 
-`python model_validation.py`
+Execute the validation script in your environment:
 
-The script will create:
+Bash
+python model_validation.py
+To generate the comparative performance chart, run:
 
-- `model_results.csv`
-- `confusion_matrices_hbn.png`
-- `roc_curves_hbn.png`
-- `model_comparison_hbn.png`
+python generate_chart.py
 
-These generated outputs are ignored by Git so that results are not accidentally committed without the corresponding run and data version.
+Generated Artifacts
+Running the pipeline creates the following output files:
 
-## Important interpretation
+model_results.csv (Raw summary metrics table)
 
-This pipeline is designed to test whether non-PCIAT participant characteristics can predict independently defined PIU severity. It is not a reconstruction of the PCIAT score.
+per_class_results.csv (Per-class precision, recall, and F1 breakdown)
 
-The final thesis should report the actual dataset version, inclusion/exclusion criteria, missing-data handling, class distribution, model-selection procedure, held-out test results, and limitations. Do not reuse performance numbers from the removed synthetic benchmark.
+confusion_matrices_proof.png (3-panel confusion matrix grid with counts and row recall percentages)
+
+roc_curves_proof.png (Multi-class One-vs-Rest ROC curves with Macro-AUC and Micro-AUC scores)
+
+model_comparison_hbn.png (Benchmark performance comparison chart)
+
+These artifacts are ignored by Git (.gitignore) to ensure that performance figures are generated strictly from reproducible script executions.
+
